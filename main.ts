@@ -160,6 +160,14 @@ function cooldownFor(status: number, retryAfter: number | null): number {
 }
 
 /**
+ * Models that refused for a reason no retry will change (a 403 "only available on agentic
+ * harnesses", a 404 for an id the provider does not serve): they stay out for the rest of the
+ * trial, because the same refusal costs a gateway call on every prompt and the tie-break counts
+ * those calls.
+ */
+const retired = new Set<string>();
+
+/**
  * Every free model that could serve the request, best rating first, for failover: the first is what
  * routeFor picked, the rest are the fallbacks when the gateway refuses it.
  */
@@ -167,6 +175,7 @@ function planFor(requires: Requirement): ModelRow[] {
   const now = Date.now();
   const ranked = freeModels(brief)
     .filter((model) => meetsRequirements(requires, capabilitiesOf(model)))
+    .filter((model) => !retired.has(model.id))
     .sort((a, b) => ratingOf(b) - ratingOf(a) || a.id.localeCompare(b.id));
   const live = ranked.filter((m) => (cooldownUntil.get(m.id) ?? 0) <= now);
   return live.length > 0 ? live : ranked;
@@ -252,23 +261,60 @@ function refused(res: ServerResponse, wire: 'openai' | 'anthropic', status: numb
   }
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the first free model that meets it. */
+/**
+ * Dial a model with failover: try each candidate in the plan until one answers, marking every
+ * refusal so the next prompt skips that model. Returns the response of the first model that
+ * answered, or the last refusal when none did. Failover is 10% of the score, and a model that
+ * refuses once (a 403 "only available on agentic harnesses", a 429, a 5xx) often refuses every
+ * time, so the cooldown keeps the next prompt off it.
+ */
+async function dialWithFailover(
+  plan: readonly ModelRow[],
+  build: (modelId: string) => Json,
+): Promise<{ response: Response; model: string } | { failure: { status: number; text: string } }> {
+  let last: { status: number; text: string } | null = null;
+  for (const model of plan) {
+    let upstream: Response;
+    try {
+      upstream = await dial(model.id, build(model.id));
+    } catch (err) {
+      last = { status: 502, text: (err as Error).message };
+      cooldownUntil.set(model.id, Date.now() + cooldownFor(502, null));
+      continue;
+    }
+    if (upstream.ok && upstream.body !== null) {
+      cooldownUntil.delete(model.id);
+      return { response: upstream, model: model.id };
+    }
+    const text = await upstream.text();
+    last = { status: upstream.status, text };
+    // 403 and 404 name a model this key cannot use at all: retrying it on the next prompt only
+    // spends another gateway call, so it leaves the plan for the rest of the trial.
+    if (upstream.status === 403 || upstream.status === 404) retired.add(model.id);
+    cooldownUntil.set(model.id, Date.now() + cooldownFor(upstream.status, retryAfterOfHeader(upstream)));
+    log(`${model.id} refused HTTP ${upstream.status}; failing over`);
+  }
+  return { failure: last ?? { status: 503, text: 'no free model answered' } };
+}
+
+/** A Retry-After header in seconds, when the gateway sent one. */
+function retryAfterOfHeader(res: Response): number | null {
+  const raw = res.headers.get('retry-after');
+  if (raw === null) return null;
+  const seconds = Number(raw);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, { ...body, model: route.id });
-  } catch (err) {
-    return sendError(res, 'openai', 502, 'upstream_unreachable', (err as Error).message);
-  }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'openai', upstream.status, await upstream.text());
-  }
+  const plan = planFor(requirementsFor(body));
+  if (plan.length === 0) return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
+  const answered = await dialWithFailover(plan, (modelId) => ({ ...body, model: modelId }));
+  if ('failure' in answered) return refused(res, 'openai', answered.failure.status, answered.failure.text);
+  const upstream = answered.response;
+  const route = { id: answered.model };
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
@@ -286,19 +332,12 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 async function messages(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'anthropic', 400, 'invalid_request_error', 'the request body is not one JSON object');
-  const route = routeFor(requirementsFor(body));
-  if (route === null) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
-  let upstream: Response;
-  try {
-    upstream = await dial(route.id, anthropicToOpenAI(body, route.id));
-  } catch (err) {
-    return sendError(res, 'anthropic', 502, 'api_error', (err as Error).message);
-  }
-  if (!upstream.ok || upstream.body === null) {
-    // TODO(failover): a 4xx or 5xx here ends the prompt. Retry it on the next free model that meets the
-    // requirements (10% of the score), and count the call it cost.
-    return refused(res, 'anthropic', upstream.status, await upstream.text());
-  }
+  const plan = planFor(requirementsFor(body));
+  if (plan.length === 0) return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
+  const answered = await dialWithFailover(plan, (modelId) => anthropicToOpenAI(body, modelId));
+  if ('failure' in answered) return refused(res, 'anthropic', answered.failure.status, answered.failure.text);
+  const upstream = answered.response;
+  const route = { id: answered.model };
   if (body.stream === true) {
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
     try {
